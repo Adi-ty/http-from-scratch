@@ -85,3 +85,144 @@ This pattern is universal in systems programming:
 - Database clients read from socket streams  
 - Log parsers read from file streams
 - All use the same core concept: **read chunks, parse boundaries, extract messages**
+
+---
+
+### WHAT is PROTOCOL
+A protocol is a defined set of rules or specifications that determine how computers or devices communicate with each other.
+It describes:
+- How data is structured — how information is broken into packets
+- How packets are formatted — headers, metadata, and payload layout
+- How data is sent and received — order, timing, and expectations
+
+By following the same protocol, both sides know exactly how to interpret and reconstruct the data correctly.
+
+---
+
+## TCP vs UDP: Reliability and Packet Delivery
+
+### Why HTTP-1 uses TCP: Reliable In-order Packets
+
+**TCP Sliding Window with ACK (Acknowledgment)**
+
+TCP ensures reliable, in-order delivery using a sliding window mechanism:
+
+```
+Sender                                    Receiver
+------                                    --------
+
+[Packet 1][Packet 2][Packet 3]
+    |
+    |----------->  Packet 1 arrives
+                         |
+                   ACK 1 <-----------
+    |
+Window slides →
+[Packet 2][Packet 3][Packet 4]
+    |
+    |----------->  Packet 2 arrives
+                         |
+                   ACK 2 <-----------
+    |
+Window slides →
+[Packet 3][Packet 4][Packet 5]
+```
+
+**How TCP Sliding Window works:**
+1. Sender transmits packets within a window (e.g., packets 1-3)
+2. Receiver acknowledges each packet with an ACK
+3. As ACKs arrive, the window "slides" forward
+4. Sender can now send newer packets (e.g., packet 4, 5...)
+5. If no ACK is received (timeout), sender retransmits the packet
+
+**Result:** Packets always arrive in order, no data loss, but slower due to waiting for ACKs.
+
+---
+
+### UDP: Fast but Unreliable (~1% packet loss)
+
+**UDP Send-All-At-Once with NACK (Negative Acknowledgment)**
+
+UDP doesn't guarantee delivery or order. For reliability, we need a custom protocol:
+
+```
+Sender                                    Receiver
+------                                    --------
+
+Send ALL packets at once:
+[1][2][3][4][5][6][7][8]...
+ |  |  |  |  |  |  |  |
+ |  |  |  X  |  |  X  |--------→  Packets: 1,2,3,5,6,8 arrive
+ |  |  |                          (4 and 7 lost - ~1% loss)
+ |  |  |                                 |
+ |  |  |                                 ↓
+ |  |  |                          Check sequence: missing 4, 7
+ |  |  |                                 |
+ |  |  |                    NACK [4,7] <-----------
+ |  |  |
+Resend [4][7] only
+    |  |
+    |  |------------------→  Packets 4, 7 arrive
+                                   |
+                                   ↓
+                            All packets received
+                            Reconstruct data in order
+```
+
+**UDP with NACK strategy:**
+1. **Send all packets** simultaneously (no waiting)
+2. Each packet has a **sequence number** (1, 2, 3...)
+3. Receiver checks for **missing sequence numbers**
+4. Receiver sends **NACK** with list of missing packet IDs
+5. Sender **retransmits only missing packets**
+6. Receiver reconstructs data in correct order
+
+**Benefits:**
+- Much faster than TCP (no waiting for individual ACKs)
+- Only ~1% packet loss to handle
+- Good for real-time applications (video streaming, gaming)
+
+**Trade-offs:**
+- Need to implement your own reliability layer
+- More complex application logic
+- May need multiple NACK rounds if retransmitted packets also get lost
+
+### TCP (Transmission Control Protocol)
+
+Transmission Control Protocol (TCP) is a primary communication protocol of the internet, though that is changing with HTTP3 (which is not built on TCP) gaining adoption.
+
+TCP is great because it allows ordered data to be safely sent across the internet. For example, let's say we want to send the message "i am live":
+
+| text | binary   |
+|------|----------|
+| i    | 01101001 |
+| a    | 01100001 |
+| m    | 01101101 |
+| l    | 01101100 |
+| i    | 01101001 |
+| v    | 01110110 |
+| e    | 01100101 |
+
+When data is sent over a network, it is sent in packets. Each message is split into packets, the packets are sent, they arrive (potentially) out of order, and they are reassembled on the other side. And without a protocol like TCP, you can't guarantee that the order is correct...
+
+You might end up with "i am evil" instead of "i am live"! TCP solves this problem.
+
+### UDP (User Datagram Protocol)
+
+User Datagram Protocol (UDP) is often compared to TCP, as they are both transport layer protocols. Here are the high-level differences between the two:
+
+| Feature        | TCP | UDP |
+|----------------|-----|-----|
+| Connection     | Yes | No  |
+| Handshake      | Yes | No  |
+| In Order       | Yes | No  |
+| Blazingly Fast | No  | Yes |
+
+TCP establishes a connection between sender and receiver with a handshake, and ensures that all the data is sent in order. UDP yeets the data to the receiver and hopes they can make sense of it.
+
+![alt text](https://storage.googleapis.com/qvault-webapp-dynamic-assets/course_assets/r16Ur2O-1271x720.png)
+![alt text](https://storage.googleapis.com/qvault-webapp-dynamic-assets/course_assets/ANc5LWX-778x702.png)
+![alt text](https://storage.googleapis.com/qvault-webapp-dynamic-assets/course_assets/ANc5LWX-778x702.png)
+
+---
+
