@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+
+	"github.com/Adi-ty/http-from-scratch/internal/headers"
 )
 
 type parserState string
 const (
 	StateInit parserState = "init"
+	StateHeaders parserState = "headers"
 	StateDone parserState = "done"
 )
 
@@ -20,12 +23,14 @@ type RequestLine struct {
 
 type Request struct {
 	RequestLine RequestLine
+	Headers    *headers.Headers
 	State parserState
 }
 
 func newRequest() *Request {
 	return &Request{
 		State: StateInit,
+		Headers: headers.NewHeaders(),
 	}
 }
 
@@ -64,9 +69,11 @@ func (r *Request) parse(data []byte) (int, error) {
 
 outer:
 	for {
+		currentData := data[read:]
+
 		switch r.State {
 		case StateInit:
-			rl, n, err := parseRequestLine(data[read:])
+			rl, n, err := parseRequestLine(currentData)
 			if err != nil {
 				return 0, err
 			}
@@ -76,10 +83,28 @@ outer:
 			r.RequestLine = *rl
 			read += n
 
-			r.State = StateDone
+			r.State = StateHeaders
+
+		case StateHeaders:
+			n, done, err := r.Headers.Parse(currentData)
+			if err != nil {
+				return 0, err
+			}
+
+			if n == 0 {
+				break outer
+			}
+
+			read += n
+			if done {
+				r.State = StateDone
+			}
 
 		case StateDone:
 			break outer
+
+		default:
+			panic("I don't know how you got here")
 		}
 
 	}

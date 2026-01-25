@@ -579,3 +579,281 @@ This handles cases where you've parsed some data but there's leftover bytes. It 
 This pattern works for any streaming protocol where messages have delimiters or known boundaries!
 
 ---
+
+## HTTP Headers Parsing Implementation
+
+### Understanding HTTP Headers Structure
+
+HTTP headers (also called "field lines" in RFC terminology) come after the request line and before the body:
+
+```
+GET /coffee HTTP/1.1\r\n          ← Request line
+Host: localhost:42069\r\n         ← Header 1
+User-Agent: curl/8.7.1\r\n        ← Header 2
+Accept: */*\r\n                   ← Header 3
+\r\n                              ← Empty line (signals end of headers)
+[optional body]
+```
+
+**Key Rules from RFC 9110:**
+
+1. **Header format:** `field-name: field-value\r\n`
+2. **Field names are case-insensitive:** `Host` and `host` are the same
+3. **Field names must be tokens:** Only certain characters allowed (alphanumeric + `#$%&'*+-.^_`|~`)
+4. **No whitespace before colon:** `Host : value` is invalid, `Host: value` is valid
+5. **Multiple headers with same name:** Should be combined with commas
+
+### State Machine Evolution: Adding Headers State
+
+Our parser now has **3 states** instead of 2:
+
+```go
+type parserState string
+const (
+    StateInit    parserState = "init"     // Parsing request line
+    StateHeaders parserState = "headers"  // Parsing headers
+    StateDone    parserState = "done"     // Parsing complete
+)
+```
+
+**State Transitions:**
+
+```
+StateInit → StateHeaders → StateDone
+```
+
+1. **StateInit:** Parse request line until we find `\r\n`
+2. **StateHeaders:** Parse headers until we find empty line `\r\n\r\n`
+3. **StateDone:** Parsing complete, ready to use request
+
+### How the Headers Parser Works
+
+The [`Headers.Parse`](internal/headers/headers.go) method is designed to work with **streaming data** (just like `parseRequestLine`):
+
+```go
+func (h *Headers) Parse(data []byte) (int, bool, error)
+```
+
+**Returns:**
+
+- `int`: Number of bytes consumed from `data`
+- `bool`: Whether we've finished parsing all headers (found empty line)
+- `error`: Any parsing errors
+
+**The Parsing Loop:**
+
+```go
+read := 0
+done := false
+
+for {
+    idx := bytes.Index(data[read:], clrf)  // Look for \r\n
+    if idx == -1 {
+        break  // Incomplete data - need more bytes
+    }
+
+    // Empty line signals end of headers
+    if idx == 0 {
+        done = true
+        read += len(clrf)
+        break
+    }
+
+    // Parse this header line
+    name, value, err := parseHeader(data[read:read+idx])
+    if err != nil {
+        return 0, false, err
+    }
+
+    read += idx + len(clrf)
+    h.Set(name, value)
+}
+
+return read, done, nil
+```
+
+**Key Points:**
+
+1. **Returns 0 bytes consumed when incomplete:** If we can't find `\r\n`, we return `(read, false, nil)` to signal "give me more data"
+2. **Empty line detection:** When `idx == 0`, it means we found `\r\n` immediately, which is the empty line separating headers from body
+3. **Accumulates bytes consumed:** `read` tracks total bytes processed across multiple header lines
+
+### Handling Multiple Headers with Same Name
+
+**RFC Requirement:** Multiple headers with the same field name should be combined with commas.
+
+**Example from the wild:**
+
+```
+Set-Cookie: sessionId=abc123
+Set-Cookie: userId=42
+```
+
+Should be treated as:
+
+```
+Set-Cookie: sessionId=abc123,userId=42
+```
+
+**Our Implementation:**
+
+```go
+func (h *Headers) Set(name, value string) {
+    name = strings.ToLower(name)  // Case-insensitive storage
+
+    if v, ok := h.headers[name]; ok {
+        // Header already exists - append with comma
+        h.headers[name] = fmt.Sprintf("%s,%s", v, value)
+    } else {
+        // New header - just set it
+        h.headers[name] = value
+    }
+}
+```
+
+**Why lowercase storage?**
+
+HTTP header names are **case-insensitive** per RFC. `Host`, `host`, and `HOST` all refer to the same header. By storing everything lowercase, we ensure:
+
+```go
+h.Get("Host")      // Returns "localhost:42069"
+h.Get("host")      // Returns "localhost:42069"
+h.Get("HOST")      // Returns "localhost:42069"
+```
+
+### Header Validation: The `isToken` Function
+
+Not all strings are valid header names. RFC 9110 defines a "token" as:
+
+```
+token = 1*tchar
+tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+        "0"-"9" / "A"-"Z" / "^" / "_" / "`" / "a"-"z" / "|" / "~"
+```
+
+**Our implementation:**
+
+```go
+func isToken(str []byte) bool {
+    for _, ch := range str {
+        found := false
+        if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' {
+            found = true
+        }
+        switch ch {
+            case '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+                found = true
+        }
+
+        if !found {
+            return false
+        }
+    }
+    return true
+}
+```
+
+**Invalid examples:**
+
+- `H©st:` - Contains invalid character ©
+- `Host :` - Has trailing space (space is not a token character)
+- `Ho st:` - Has space in the middle
+
+### Integration with the State Machine
+
+The headers state fits into our existing streaming parser in [`internal/request/request.go`](internal/request/request.go):
+
+```go
+func (r *Request) parse(data []byte) (int, error) {
+    read := 0
+
+outer:
+    for {
+        currentData := data[read:]
+
+        switch r.State {
+        case StateInit:
+            // Parse request line...
+            rl, n, err := parseRequestLine(currentData)
+            if n == 0 { break outer }  // Need more data
+            r.RequestLine = *rl
+            read += n
+            r.State = StateHeaders  // ← Transition to headers state
+
+        case StateHeaders:
+            // Parse headers...
+            n, done, err := r.Headers.Parse(currentData)
+            if n == 0 { break outer }  // Need more data
+            read += n
+            if done {
+                r.State = StateDone  // ← Found empty line, done parsing
+            }
+
+        case StateDone:
+            break outer
+        }
+    }
+    return read, nil
+}
+```
+
+**Flow Example with Chunked Data:**
+
+```
+Chunk 1: "GET /coffee HTTP/1.1\r\nHo"
+→ StateInit: Parse request line (20 bytes) → StateHeaders
+→ StateHeaders: Parse headers - no \r\n found → return 0 bytes
+→ Buffer accumulates: "Ho"
+
+Chunk 2: "st: localhost:42069\r\nUser-Agent"
+→ StateHeaders: Parse "Host: localhost:42069\r\n" (23 bytes)
+→ Buffer accumulates: "User-Agent"
+
+Chunk 3: ": curl/8.7.1\r\n\r\n"
+→ StateHeaders: Parse "User-Agent: curl/8.7.1\r\n" (24 bytes)
+→ StateHeaders: Found empty line "\r\n" → done=true → StateDone
+→ Parsing complete!
+```
+
+### Why This Design Works for Streaming
+
+**The beauty of returning consumed bytes:**
+
+Each parsing function returns how many bytes it consumed. The main loop uses this to:
+
+1. **Skip parsed data:** `currentData := data[read:]`
+2. **Handle incomplete data:** When `n == 0`, break and wait for more
+3. **Accumulate across reads:** Buffer management in `RequestFromReader`
+
+**Buffer Management Pattern:**
+
+```go
+buf := make([]byte, 1024)
+bufLen := 0
+
+for !request.done() {
+    n, _ := reader.Read(buf[bufLen:])      // Read NEW data AFTER existing
+    bufLen += n
+
+    readN, _ := request.parse(buf[:bufLen]) // Parse ALL accumulated data
+
+    copy(buf, buf[readN:bufLen])           // Shift unparsed data to start
+    bufLen -= readN
+}
+```
+
+This pattern handles **any** message size and **any** chunk size, which is exactly what you need for real network protocols!
+
+### Testing Multiple Headers
+
+From [`internal/headers/headers_test.go`](internal/headers/headers_test.go):
+
+```go
+headers = NewHeaders()
+data = []byte("Host: localhost:42069\r\nHost: localhost:42069\r\n")
+n, done, err = headers.Parse(data)
+
+assert.Equal(t, "localhost:42069,localhost:42069", headers.Get("Host"))
+```
+
+The same header appears twice, and our implementation correctly combines them with a comma, as required by the RFC.
