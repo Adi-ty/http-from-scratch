@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/Adi-ty/http-from-scratch/internal/headers"
 )
 
 type parserState string
+
 const (
-	StateInit parserState = "init"
+	StateInit    parserState = "init"
 	StateHeaders parserState = "headers"
-	StateDone parserState = "done"
+	StateBody    parserState = "body"
+	StateDone    parserState = "done"
 )
 
 type RequestLine struct {
@@ -23,18 +26,34 @@ type RequestLine struct {
 
 type Request struct {
 	RequestLine RequestLine
-	Headers    *headers.Headers
-	State parserState
+	Headers     *headers.Headers
+	Body        string
+	State       parserState
+}
+
+func getInt(headers *headers.Headers, name string, defaultValue int) int {
+	valueStr, exists := headers.Get(name)
+	if !exists {
+		return defaultValue
+	}
+
+	value, err := strconv.Atoi(valueStr)
+	if err != nil {
+		return defaultValue
+	}
+
+	return value
 }
 
 func newRequest() *Request {
 	return &Request{
-		State: StateInit,
+		State:   StateInit,
 		Headers: headers.NewHeaders(),
+		Body:    "",
 	}
 }
 
-var SEPARATOR = []byte("\r\n")	
+var SEPARATOR = []byte("\r\n")
 
 func parseRequestLine(b []byte) (*RequestLine, int, error) {
 	idx := bytes.Index(b, SEPARATOR)
@@ -43,8 +62,8 @@ func parseRequestLine(b []byte) (*RequestLine, int, error) {
 	}
 
 	startLine := b[:idx]
-	read := idx+len(SEPARATOR)
-	 
+	read := idx + len(SEPARATOR)
+
 	parts := bytes.Split(startLine, []byte(" "))
 	if len(parts) != 3 {
 		return nil, 0, fmt.Errorf("Malformed request line")
@@ -56,12 +75,17 @@ func parseRequestLine(b []byte) (*RequestLine, int, error) {
 	}
 
 	rl := &RequestLine{
-		Method: string(parts[0]),
+		Method:        string(parts[0]),
 		RequestTarget: string(parts[1]),
-		HttpVersion: string(httpParts[1]),
+		HttpVersion:   string(httpParts[1]),
 	}
 
 	return rl, read, nil
+}
+
+func (r *Request) hasBody() bool {
+	length := getInt(r.Headers, "content-length", 0)
+	return length > 0
 }
 
 func (r *Request) parse(data []byte) (int, error) {
@@ -70,6 +94,9 @@ func (r *Request) parse(data []byte) (int, error) {
 outer:
 	for {
 		currentData := data[read:]
+		if len(currentData) == 0 {
+			break outer
+		}
 
 		switch r.State {
 		case StateInit:
@@ -97,9 +124,26 @@ outer:
 
 			read += n
 			if done {
-				r.State = StateDone
+				if r.hasBody() {
+					r.State = StateBody
+				} else {
+					r.State = StateDone
+				}
 			}
 
+		case StateBody:
+			length := getInt(r.Headers, "content-length", 0)
+			if length == 0 {
+				panic("Chunked not implemented")
+			}
+
+			remaining := min(length-len(r.Body), len(currentData))
+			r.Body += string(currentData[:remaining])
+			read += remaining
+
+			if len(r.Body) == length {
+				r.State = StateDone
+			}
 		case StateDone:
 			break outer
 
@@ -108,12 +152,11 @@ outer:
 		}
 
 	}
-	
+
 	return read, nil
 }
 
 func (r *Request) done() bool {
-
 	return r.State == StateDone
 }
 
@@ -127,7 +170,7 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 		if err != nil {
 			return nil, err
 		}
-		bufLen += n	
+		bufLen += n
 
 		readN, err := request.parse(buf[:bufLen])
 		if err != nil {
@@ -138,6 +181,6 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 		bufLen -= readN
 	}
 
-	
 	return request, nil
 }
+

@@ -29,10 +29,14 @@ func main() {
 		fmt.Printf("- Method: %s", r.RequestLine.Method)
 		fmt.Printf("\n- Path: %s", r.RequestLine.RequestTarget)
 		fmt.Printf("\n- Version: %s\n", r.RequestLine.HttpVersion)
-		
+
 		fmt.Printf("Headers:\n")
 		r.Headers.Iterate(func(name, value string) {
 			fmt.Printf("- %s: %s\n", name, value)
 		})
+
+		fmt.Printf("Body:\n")
+		fmt.Printf("\n%s\n", r.Body)
 	}
 }
+

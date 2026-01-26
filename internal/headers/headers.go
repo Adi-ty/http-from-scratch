@@ -13,8 +13,8 @@ func isToken(str []byte) bool {
 			found = true
 		}
 		switch ch {
-			case '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-				found = true
+		case '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			found = true
 		}
 
 		if !found {
@@ -26,6 +26,7 @@ func isToken(str []byte) bool {
 }
 
 var clrf = []byte("\r\n")
+
 func parseHeader(fieldLine []byte) (string, string, error) {
 	parts := bytes.SplitN(fieldLine, []byte(":"), 2)
 	if len(parts) != 2 {
@@ -47,13 +48,14 @@ type Headers struct {
 }
 
 func NewHeaders() *Headers {
-	return &Headers {
+	return &Headers{
 		headers: map[string]string{},
 	}
 }
 
-func (h *Headers) Get(name string) string {
-	return h.headers[strings.ToLower(name)]
+func (h *Headers) Get(name string) (string, bool) {
+	value, ok := h.headers[strings.ToLower(name)]
+	return value, ok
 }
 
 func (h *Headers) Set(name, value string) {
@@ -64,13 +66,13 @@ func (h *Headers) Set(name, value string) {
 	} else {
 		h.headers[name] = value
 	}
-	
+
 }
 
 func (h *Headers) Iterate(cb func(name, value string)) {
-    for name, value := range h.headers {
-        cb(name, value)
-    }
+	for name, value := range h.headers {
+		cb(name, value)
+	}
 }
 
 func (h *Headers) Parse(data []byte) (int, bool, error) {
@@ -90,7 +92,7 @@ func (h *Headers) Parse(data []byte) (int, bool, error) {
 			break
 		}
 
-		name, value, err := parseHeader(data[read:read+idx])
+		name, value, err := parseHeader(data[read : read+idx])
 		if err != nil {
 			return 0, false, err
 		}
@@ -106,3 +108,4 @@ func (h *Headers) Parse(data []byte) (int, bool, error) {
 
 	return read, done, nil
 }
+

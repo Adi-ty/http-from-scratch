@@ -310,23 +310,23 @@ For the body, we need to know **how long it will be**. There are a couple of dif
 
 1. **Content-Length**: Specifies exactly how many bytes the body is
 
-    ```
-    Content-Length: 1234\r\n
-    \r\n
-    [1234 bytes of data]
-    ```
+   ```
+   Content-Length: 1234\r\n
+   \r\n
+   [1234 bytes of data]
+   ```
 
 2. **Chunked Transfer Encoding**: Send body in chunks, each prefixed with its size
-    ```
-    Transfer-Encoding: chunked\r\n
-    \r\n
-    5\r\n
-    hello\r\n
-    6\r\n
-    world!\r\n
-    0\r\n
-    \r\n
-    ```
+   ```
+   Transfer-Encoding: chunked\r\n
+   \r\n
+   5\r\n
+   hello\r\n
+   6\r\n
+   world!\r\n
+   0\r\n
+   \r\n
+   ```
 
 ### HTTP Versions: Same Semantics, Different Implementation
 
@@ -385,9 +385,10 @@ read: Accept: */*
 **Breaking it down:**
 
 1. **`GET /coffee HTTP/1.1`** - The request line
-    - Method: `GET`
-    - Path: `/coffee`
-    - Version: `HTTP/1.1`
+
+   - Method: `GET`
+   - Path: `/coffee`
+   - Version: `HTTP/1.1`
 
 2. **`Host: localhost:42069`** - Required header specifying the server
 3. **`User-Agent: curl/8.7.1`** - Identifies the client making the request
@@ -857,3 +858,431 @@ assert.Equal(t, "localhost:42069,localhost:42069", headers.Get("Host"))
 ```
 
 The same header appears twice, and our implementation correctly combines them with a comma, as required by the RFC.
+
+---
+
+## HTTP Body Parsing - The Final State
+
+### Adding StateBody to the State Machine
+
+Our parser now has **4 states** to handle complete HTTP requests:
+
+```go
+type parserState string
+const (
+    StateInit    parserState = "init"     // Parsing request line
+    StateHeaders parserState = "headers"  // Parsing headers
+    StateBody    parserState = "body"     // Parsing body (if present)
+    StateDone    parserState = "done"     // Parsing complete
+)
+```
+
+**State Transitions:**
+
+```
+StateInit → StateHeaders → hasBody() check
+                              ↓           ↓
+                          StateBody    StateDone
+                              ↓
+                          StateDone
+```
+
+### The Body Parsing Challenge
+
+**Key difference from request line and headers:**
+
+- Request line has delimiter: `\r\n`
+- Headers have delimiter: `\r\n` (and empty line `\r\n\r\n` signals end)
+- **Body has NO delimiter!**
+
+**Question: How do we know when the body ends?**
+
+**Answer: The `Content-Length` header tells us!**
+
+```
+POST /submit HTTP/1.1\r\n
+Host: localhost\r\n
+Content-Length: 13\r\n          ← This tells us body is 13 bytes
+\r\n
+hello world!\n                  ← Exactly 13 bytes
+```
+
+### Implementation: StateBody Case
+
+From [`internal/request/request.go`](internal/request/request.go):
+
+```go
+case StateBody:
+    if len(currentData) == 0 {
+        break outer  // No data to process
+    }
+
+    length := getInt(r.Headers, "content-length", 0)
+    if length == 0 {
+        panic("Chunked not implemented")
+    }
+
+    // Calculate how much to read from current chunk
+    remaining := min(length-len(r.Body), len(currentData))
+
+    r.Body += string(currentData[:remaining])
+    read += remaining
+
+    // Are we done?
+    if len(r.Body) == length {
+        r.State = StateDone
+    }
+```
+
+**Breaking it down:**
+
+1. **Check if we have data:** `if len(currentData) == 0` → nothing to process
+2. **Get expected body size:** `length := getInt(r.Headers, "content-length", 0)`
+3. **Calculate bytes to read:** `remaining := min(length - len(r.Body), len(currentData))`
+   - `length - len(r.Body)` = how many bytes we still need
+   - `len(currentData)` = how many bytes available right now
+   - Take the **minimum** (can't read more than we have!)
+4. **Accumulate body:** `r.Body += string(currentData[:remaining])`
+5. **Track consumption:** `read += remaining`
+6. **Check completion:** `if len(r.Body) == length` → we're done!
+
+### Example: Body Arriving in Chunks
+
+Request with 13-byte body arriving in **3 chunks**:
+
+```
+POST /submit HTTP/1.1\r\n
+Host: localhost\r\n
+Content-Length: 13\r\n
+\r\n
+hello world!\n
+```
+
+#### **Chunk 1: Headers + partial body `"hello"`**
+
+After parsing headers, we transition to StateBody:
+
+```go
+case StateHeaders:
+    // ... parsed headers, found empty line ...
+    if done {
+        if r.hasBody() {  // Content-Length: 13 → TRUE
+            r.State = StateBody  // ← Go to body state
+        } else {
+            r.State = StateDone
+        }
+    }
+
+// Next iteration of parse loop:
+case StateBody:
+    currentData = "hello"  // 5 bytes available
+
+    length = 13            // Need 13 total
+    remaining = min(13 - 0, 5) = 5
+
+    r.Body = "hello"       // Accumulated so far
+    read += 5
+
+    len(r.Body) = 5, need 13 → NOT done yet
+```
+
+**State stays `StateBody`**, parse returns, outer loop reads more data.
+
+#### **Chunk 2: `" world"`**
+
+```go
+case StateBody:
+    currentData = " world"  // 6 bytes available
+
+    length = 13
+    remaining = min(13 - 5, 6) = 6
+
+    r.Body = "hello world"  // Now 11 bytes
+    read += 6
+
+    len(r.Body) = 11, need 13 → Still NOT done
+```
+
+**State stays `StateBody`**, parse returns, outer loop reads more.
+
+#### **Chunk 3: `"!\n"`**
+
+```go
+case StateBody:
+    currentData = "!\n"     // 2 bytes available
+
+    length = 13
+    remaining = min(13 - 11, 2) = 2
+
+    r.Body = "hello world!\n"  // Now 13 bytes
+    read += 2
+
+    len(r.Body) = 13, need 13 → COMPLETE! ✅
+    r.State = StateDone
+```
+
+**State transitions to `StateDone`**, outer loop exits!
+
+### The `hasBody()` Helper Function
+
+After parsing headers, we need to decide: transition to StateBody or StateDone?
+
+```go
+func (r *Request) hasBody() bool {
+    length := getInt(r.Headers, "content-length", 0)
+    return length > 0
+}
+```
+
+**Used in StateHeaders:**
+
+```go
+case StateHeaders:
+    n, done, err := r.Headers.Parse(currentData)
+    // ...
+    if done {
+        if r.hasBody() {       // Check if body exists
+            r.State = StateBody // ← Parse body next
+        } else {
+            r.State = StateDone // ← No body, we're done!
+        }
+    }
+```
+
+**Examples:**
+
+**GET request (no body):**
+
+```
+GET /coffee HTTP/1.1\r\n
+Host: localhost\r\n
+\r\n
+```
+
+- No `Content-Length` header
+- `hasBody()` → FALSE
+- StateHeaders → **StateDone** (skip StateBody entirely!)
+
+**POST request (has body):**
+
+```
+POST /submit HTTP/1.1\r\n
+Content-Length: 5\r\n
+\r\n
+hello
+```
+
+- `Content-Length: 5` exists
+- `hasBody()` → TRUE
+- StateHeaders → **StateBody** → StateDone
+
+### Why `min()` is Critical
+
+```go
+remaining := min(length - len(r.Body), len(currentData))
+```
+
+**Scenario 1: Need more than we have**
+
+- Need: 13 bytes total, have: 5 bytes so far
+- Current chunk: 3 bytes
+- `remaining = min(13 - 5, 3) = min(8, 3) = 3` ✅
+- Read 3 bytes (all available), wait for more
+
+**Scenario 2: Have more than we need**
+
+- Need: 13 bytes total, have: 10 bytes so far
+- Current chunk: 20 bytes (maybe next request started!)
+- `remaining = min(13 - 10, 20) = min(3, 20) = 3` ✅
+- Read only 3 bytes (exactly what we need), leave the rest
+
+Without `min()`, we'd read too much and consume bytes from the **next HTTP request**!
+
+### Body Parsing vs Request Line/Headers
+
+**Similarities:**
+
+- All accumulate data across multiple reads
+- All return bytes consumed
+- All handle incomplete data gracefully
+
+**Key Difference:**
+
+| Part         | Delimiter  | How we know it's complete           |
+| ------------ | ---------- | ----------------------------------- |
+| Request Line | `\r\n`     | Found the delimiter                 |
+| Headers      | `\r\n\r\n` | Found empty line                    |
+| **Body**     | **None!**  | **Counted bytes == Content-Length** |
+
+Body parsing is **count-based**, not **delimiter-based**!
+
+### The Complete Parse Loop with Body
+
+```go
+func (r *Request) parse(data []byte) (int, error) {
+    read := 0
+
+outer:
+    for {
+        currentData := data[read:]
+        if len(currentData) == 0 {
+            break outer
+        }
+
+        switch r.State {
+        case StateInit:
+            rl, n, err := parseRequestLine(currentData)
+            if err != nil { return 0, err }
+            if n == 0 { break outer }
+            r.RequestLine = *rl
+            read += n
+            r.State = StateHeaders
+
+        case StateHeaders:
+            n, done, err := r.Headers.Parse(currentData)
+            if err != nil { return 0, err }
+            if n == 0 { break outer }
+            read += n
+            if done {
+                if r.hasBody() {
+                    r.State = StateBody  // ← Transition to body
+                } else {
+                    r.State = StateDone
+                }
+            }
+
+        case StateBody:
+            length := getInt(r.Headers, "content-length", 0)
+            if length == 0 {
+                panic("Chunked not implemented")
+            }
+            remaining := min(length-len(r.Body), len(currentData))
+            r.Body += string(currentData[:remaining])
+            read += remaining
+
+            if len(r.Body) == length {
+                r.State = StateDone  // ← Transition to done
+            }
+
+        case StateDone:
+            break outer
+        }
+    }
+    return read, nil
+}
+```
+
+**The flow:**
+
+```
+Data arrives → Parse in current state → Consume bytes → Update state → Repeat
+                                    ↓
+                         If incomplete, return 0 and wait for more data
+```
+
+### Testing Body Parsing
+
+From [`internal/request/request_test.go`](internal/request/request_test.go):
+
+**Test 1: Body arrives in tiny chunks (3 bytes at a time)**
+
+```go
+reader := &chunkReader{
+    data: "POST /submit HTTP/1.1\r\n" +
+          "Content-Length: 13\r\n" +
+          "\r\n" +
+          "hello world!\n",
+    numBytesPerRead: 3,  // Simulate slow network!
+}
+
+r, err := RequestFromReader(reader)
+require.NoError(t, err)
+assert.Equal(t, "hello world!\n", r.Body)
+assert.Equal(t, "POST", r.RequestLine.Method)
+```
+
+**How it works:**
+
+- Reads 3 bytes at a time
+- Accumulates across ~23 read operations
+- Successfully parses the complete request
+- Proves the streaming parser handles any chunk size!
+
+**Test 2: Request without body (GET)**
+
+```go
+reader := &chunkReader{
+    data: "GET /coffee HTTP/1.1\r\n\r\n",
+    numBytesPerRead: 10,
+}
+
+r, err := RequestFromReader(reader)
+require.NoError(t, err)
+assert.Equal(t, "", r.Body)  // No body
+assert.Equal(t, "GET", r.RequestLine.Method)
+```
+
+**How it works:**
+
+- After headers, `hasBody()` returns false
+- State transitions: StateInit → StateHeaders → **StateDone**
+- StateBody is **never entered**!
+
+### Visual: Complete Request Parsing
+
+```
+┌─────────────────────────────────────────────────┐
+│         Request Arrives in Chunks               │
+│   "POST /submit HTTP/1.1\r\nCo"                │
+│   "ntent-Length: 13\r\n\r\n"                   │
+│   "hello"                                       │
+│   " world!\n"                                   │
+└────────────────┬────────────────────────────────┘
+                 ▼
+      ┌──────────────────────┐
+      │ Buffer Management    │
+      │ Accumulate + Shift   │
+      └──────────┬───────────┘
+                 ▼
+      ┌──────────────────────┐
+      │ StateInit            │
+      │ Parse request line   │
+      │ Found: POST /submit  │
+      └──────────┬───────────┘
+                 ▼
+      ┌──────────────────────┐
+      │ StateHeaders         │
+      │ Parse headers        │
+      │ Found Content-Length │
+      │ Found empty line     │
+      └──────────┬───────────┘
+                 ▼
+         ┌──────────────┐
+         │ hasBody()?   │
+         └───┬──────┬───┘
+             │      │
+        Yes  │      │ No
+             ▼      ▼
+      ┌──────────┐ ┌──────────┐
+      │StateBody │ │StateDone │
+      │Accumulate│ └──────────┘
+      │13 bytes  │
+      └────┬─────┘
+           │
+      ┌────▼──────────────────┐
+      │ len(Body) == 13?      │
+      │ YES → StateDone       │
+      └───────────────────────┘
+```
+
+### Summary: Why Body Parsing Fits Perfectly
+
+The body state integrates seamlessly into the streaming parser because:
+
+1. **Same byte-counting pattern:** Returns bytes consumed, accumulates across reads
+2. **Clear completion condition:** `len(Body) == Content-Length`
+3. **State machine clarity:** One state, one responsibility (accumulate body bytes)
+4. **Memory efficient:** Can handle large bodies without buffering entire request
+5. **Works with any chunk size:** From 1-byte reads to full-body reads
+
+The body is just **counted accumulation** instead of **delimiter-based parsing**, but the fundamental streaming approach remains identical! 🎯
