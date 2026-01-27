@@ -58,6 +58,11 @@ func (h *Headers) Get(name string) (string, bool) {
 	return value, ok
 }
 
+func (h *Headers) Replace(name, value string) {
+	name = strings.ToLower(name)
+	h.headers[name] = value
+}
+
 func (h *Headers) Set(name, value string) {
 	name = strings.ToLower(name)
 
@@ -66,7 +71,6 @@ func (h *Headers) Set(name, value string) {
 	} else {
 		h.headers[name] = value
 	}
-
 }
 
 func (h *Headers) Iterate(cb func(name, value string)) {
