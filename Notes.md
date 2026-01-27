@@ -310,23 +310,23 @@ For the body, we need to know **how long it will be**. There are a couple of dif
 
 1. **Content-Length**: Specifies exactly how many bytes the body is
 
-   ```
-   Content-Length: 1234\r\n
-   \r\n
-   [1234 bytes of data]
-   ```
+    ```
+    Content-Length: 1234\r\n
+    \r\n
+    [1234 bytes of data]
+    ```
 
 2. **Chunked Transfer Encoding**: Send body in chunks, each prefixed with its size
-   ```
-   Transfer-Encoding: chunked\r\n
-   \r\n
-   5\r\n
-   hello\r\n
-   6\r\n
-   world!\r\n
-   0\r\n
-   \r\n
-   ```
+    ```
+    Transfer-Encoding: chunked\r\n
+    \r\n
+    5\r\n
+    hello\r\n
+    6\r\n
+    world!\r\n
+    0\r\n
+    \r\n
+    ```
 
 ### HTTP Versions: Same Semantics, Different Implementation
 
@@ -385,10 +385,9 @@ read: Accept: */*
 **Breaking it down:**
 
 1. **`GET /coffee HTTP/1.1`** - The request line
-
-   - Method: `GET`
-   - Path: `/coffee`
-   - Version: `HTTP/1.1`
+    - Method: `GET`
+    - Path: `/coffee`
+    - Version: `HTTP/1.1`
 
 2. **`Host: localhost:42069`** - Required header specifying the server
 3. **`User-Agent: curl/8.7.1`** - Identifies the client making the request
@@ -939,9 +938,9 @@ case StateBody:
 1. **Check if we have data:** `if len(currentData) == 0` → nothing to process
 2. **Get expected body size:** `length := getInt(r.Headers, "content-length", 0)`
 3. **Calculate bytes to read:** `remaining := min(length - len(r.Body), len(currentData))`
-   - `length - len(r.Body)` = how many bytes we still need
-   - `len(currentData)` = how many bytes available right now
-   - Take the **minimum** (can't read more than we have!)
+    - `length - len(r.Body)` = how many bytes we still need
+    - `len(currentData)` = how many bytes available right now
+    - Take the **minimum** (can't read more than we have!)
 4. **Accumulate body:** `r.Body += string(currentData[:remaining])`
 5. **Track consumption:** `read += remaining`
 6. **Check completion:** `if len(r.Body) == length` → we're done!
@@ -1286,3 +1285,5 @@ The body state integrates seamlessly into the streaming parser because:
 5. **Works with any chunk size:** From 1-byte reads to full-body reads
 
 The body is just **counted accumulation** instead of **delimiter-based parsing**, but the fundamental streaming approach remains identical! 🎯
+
+---
