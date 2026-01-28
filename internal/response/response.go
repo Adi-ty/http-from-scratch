@@ -27,18 +27,15 @@ func GetDefaultHeaders(contentLen int) *headers.Headers {
 	return h
 }
 
-func WriteHeaders(w io.Writer, headers *headers.Headers) error {
-	b := []byte{}
-	headers.Iterate(func(key, value string) {
-		b = fmt.Appendf(b, "%s: %s\r\n", key, value)
-	})
-	b = fmt.Append(b, "\r\n")
-	_, err := w.Write(b)
-
-	return err
+type Writer struct {
+	writer io.Writer
 }
 
-func WriteStatusLine(w io.Writer, statusCode StatusCode) error {
+func NewWriter(writer io.Writer) *Writer {
+	return &Writer{writer: writer}
+}
+
+func (w *Writer) WriteStatusLine(statusCode StatusCode) error {
 	statusLine := []byte{}
 	switch statusCode {
 	case StatusOK:
@@ -51,6 +48,24 @@ func WriteStatusLine(w io.Writer, statusCode StatusCode) error {
 		return fmt.Errorf("unrecognized error code")
 	}
 
-	_, err := w.Write(statusLine)
+	_, err := w.writer.Write(statusLine)
 	return err
 }
+
+func (w *Writer) WriteHeaders(headers headers.Headers) error {
+	b := []byte{}
+	headers.Iterate(func(key, value string) {
+		b = fmt.Appendf(b, "%s: %s\r\n", key, value)
+	})
+	b = fmt.Append(b, "\r\n")
+	_, err := w.writer.Write(b)
+
+	return err
+}
+
+func (w *Writer) WriteBody(body []byte) (int, error) {
+	n, err := w.writer.Write(body)
+
+	return n, err
+}
+
