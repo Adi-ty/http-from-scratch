@@ -1287,3 +1287,620 @@ The body state integrates seamlessly into the streaming parser because:
 The body is just **counted accumulation** instead of **delimiter-based parsing**, but the fundamental streaming approach remains identical! 🎯
 
 ---
+
+## Building an HTTP Server: From Request to Response
+
+Now that we can **parse** HTTP requests, we need to **generate** HTTP responses and tie everything together into a working server!
+
+### HTTP Response Structure
+
+Just like requests, HTTP responses follow a specific format:
+
+```
+HTTP/1.1 200 OK\r\n                    ← Status line
+Content-Length: 10\r\n                 ← Headers
+Content-Type: text/plain\r\n
+Connection: close\r\n
+\r\n                                   ← Empty line
+All good \n                            ← Body
+```
+
+**Three parts:**
+
+1. **Status line:** `HTTP/1.1 [status code] [status text]\r\n`
+2. **Headers:** Same format as request headers
+3. **Body:** The response content (HTML, JSON, plain text, etc.)
+
+### The Response Package
+
+From [`internal/response/response.go`](internal/response/response.go):
+
+#### **Status Codes**
+
+```go
+type StatusCode int
+
+const (
+    StatusOK                  StatusCode = 200
+    StatusBadRequest          StatusCode = 400
+    StatusInternalServerError StatusCode = 500
+)
+```
+
+These represent common HTTP status codes. In the real world, there are many more (404 Not Found, 201 Created, 301 Redirect, etc.), but we start with the essentials.
+
+#### **Writing the Status Line**
+
+```go
+func WriteStatusLine(w io.Writer, statusCode StatusCode) error {
+    statusLine := []byte{}
+    switch statusCode {
+    case StatusOK:
+        statusLine = []byte("HTTP/1.1 200 OK\r\n")
+    case StatusBadRequest:
+        statusLine = []byte("HTTP/1.1 400 Bad Request\r\n")
+    case StatusInternalServerError:
+        statusLine = []byte("HTTP/1.1 500 Internal Server Error\r\n")
+    default:
+        return fmt.Errorf("unrecognized error code")
+    }
+
+    _, err := w.Write(statusLine)
+    return err
+}
+```
+
+**What this does:**
+
+- Takes a status code and converts it to the proper HTTP format
+- Writes it to any `io.Writer` (could be TCP connection, buffer, file, etc.)
+- Returns error if something goes wrong
+
+**Example output:** `HTTP/1.1 200 OK\r\n`
+
+#### **Default Headers Helper**
+
+```go
+func GetDefaultHeaders(contentLen int) *headers.Headers {
+    h := headers.NewHeaders()
+    h.Set("Content-Length", fmt.Sprintf("%d", contentLen))
+    h.Set("Connection", "close")
+    h.Set("Content-Type", "text/plain")
+
+    return h
+}
+```
+
+**Why default headers?**
+
+- **Content-Length:** Tells the client how many bytes to expect in the body
+- **Connection: close:** Tells the client we'll close the connection after this response
+- **Content-Type:** Tells the client the body is plain text (not HTML, JSON, etc.)
+
+These are the **minimum headers** needed for a valid HTTP response.
+
+#### **Writing Headers**
+
+```go
+func WriteHeaders(w io.Writer, headers *headers.Headers) error {
+    b := []byte{}
+    headers.Iterate(func(key, value string) {
+        b = fmt.Appendf(b, "%s: %s\r\n", key, value)
+    })
+    b = fmt.Append(b, "\r\n")  // ← Empty line signals end of headers!
+    _, err := w.Write(b)
+
+    return err
+}
+```
+
+**What this does:**
+
+1. Iterates over all headers using the `Iterate` method we added earlier
+2. Formats each as `Key: Value\r\n`
+3. Adds the crucial **empty line** (`\r\n`) at the end
+4. Writes everything at once
+
+**Example output:**
+
+```
+Content-Length: 10\r\n
+Connection: close\r\n
+Content-Type: text/plain\r\n
+\r\n
+```
+
+### The Server Package
+
+From [`internal/server/server.go`](internal/server/server.go):
+
+#### **Handler Function Type**
+
+```go
+type HandlerError struct {
+    StatusCode response.StatusCode
+    Message    string
+}
+
+type Handler func(w io.Writer, req *request.Request) *HandlerError
+```
+
+**Key design decision:** Handlers are **functions** that:
+
+- Take a writer (to write response body) and a request
+- Return either `nil` (success) or a `HandlerError` (something went wrong)
+
+**Why return error as a struct?**
+
+- Handler can specify **what went wrong** (StatusCode + Message)
+- Server can decide how to format the error response
+- Separates business logic from HTTP protocol details
+
+#### **Processing a Single Connection**
+
+```go
+func runConnection(s *Server, conn io.ReadWriteCloser) {
+    defer conn.Close()  // Always close connection when done
+
+    headers := response.GetDefaultHeaders(0)
+
+    // Step 1: Parse the request
+    r, err := request.RequestFromReader(conn)
+    if err != nil {
+        // Parsing failed - send 400 Bad Request
+        response.WriteStatusLine(conn, response.StatusBadRequest)
+        response.WriteHeaders(conn, headers)
+        return
+    }
+
+    // Step 2: Run the user's handler (writes to buffer, not connection)
+    writer := bytes.NewBuffer([]byte{})
+    handlerError := s.handler(writer, r)
+
+    // Step 3: Determine response status and body
+    var body []byte = nil
+    var status response.StatusCode = response.StatusOK
+    if handlerError != nil {
+        status = handlerError.StatusCode
+        body = []byte(handlerError.Message)
+    } else {
+        body = writer.Bytes()
+    }
+
+    // Step 4: Update Content-Length (now we know body size!)
+    headers.Replace("Content-Length", fmt.Sprintf("%d", len(body)))
+
+    // Step 5: Write response to connection
+    response.WriteStatusLine(conn, status)
+    response.WriteHeaders(conn, headers)
+    conn.Write(body)
+}
+```
+
+**The Flow Explained:**
+
+**1. Parse the request:**
+
+```go
+r, err := request.RequestFromReader(conn)
+```
+
+Uses our streaming parser! If parsing fails (malformed HTTP), return 400 Bad Request immediately.
+
+**2. Run handler into a buffer:**
+
+```go
+writer := bytes.NewBuffer([]byte{})
+handlerError := s.handler(writer, r)
+```
+
+**Why a buffer and not write directly to the connection?**
+
+We need to know the body size **before** writing headers! Remember, `Content-Length` must be in the headers:
+
+```
+Content-Length: 10\r\n    ← Need this FIRST
+\r\n
+All good \n               ← Body comes AFTER
+```
+
+By writing to a buffer first, we can:
+
+- Let the handler write whatever it wants
+- Measure the size
+- Set `Content-Length` correctly
+- Then send everything in the right order
+
+**3. Determine status and body:**
+
+```go
+if handlerError != nil {
+    status = handlerError.StatusCode
+    body = []byte(handlerError.Message)
+} else {
+    body = writer.Bytes()
+}
+```
+
+If handler returned an error, use the error message as body. Otherwise, use what the handler wrote.
+
+**4. Update Content-Length:**
+
+```go
+headers.Replace("Content-Length", fmt.Sprintf("%d", len(body)))
+```
+
+Now we know the actual body size, update the header!
+
+**5. Write response:**
+
+```go
+response.WriteStatusLine(conn, status)    // HTTP/1.1 200 OK\r\n
+response.WriteHeaders(conn, headers)       // Headers + \r\n
+conn.Write(body)                           // Body
+```
+
+Everything written in the **correct order** to the TCP connection.
+
+#### **Running the Server Loop**
+
+```go
+func runServer(s *Server, listener net.Listener) {
+    for {
+        conn, err := listener.Accept()  // Wait for connection
+        if s.closed {
+            return
+        }
+
+        if err != nil {
+            return
+        }
+        go runConnection(s, conn)  // Handle in goroutine (concurrent!)
+    }
+}
+```
+
+**What this does:**
+
+1. **Accept:** Blocks until a client connects
+2. **Check if closed:** Allows graceful shutdown
+3. **Spawn goroutine:** Each connection handled concurrently (multiple clients at once!)
+
+**Why `go runConnection()`?**
+
+Without the `go` keyword, the server would handle one request at a time:
+
+```
+Client 1 connects → Process → Close → Client 2 connects → Process → ...
+```
+
+With `go`, multiple clients can be served simultaneously:
+
+```
+Client 1 connects → go Process
+Client 2 connects → go Process  (Client 1 still processing!)
+Client 3 connects → go Process  (Clients 1 & 2 still processing!)
+```
+
+This is **concurrent request handling** - essential for real servers!
+
+#### **Starting the Server**
+
+```go
+func Serve(port uint16, handler Handler) (*Server, error) {
+    listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+    if err != nil {
+        return nil, err
+    }
+    server := &Server{closed: false, handler: handler}
+    go runServer(server, listener)  // Run in background
+
+    return server, nil
+}
+```
+
+**What this does:**
+
+1. **Create TCP listener:** Binds to port (e.g., `:42069`)
+2. **Create server struct:** Stores handler function and closed state
+3. **Start server loop in goroutine:** Doesn't block, returns immediately
+4. **Return server handle:** Allows caller to shut down later
+
+**Why run in goroutine?**
+
+So `Serve()` returns immediately and doesn't block. The main program can do other things (like wait for SIGINT):
+
+```go
+server, _ := server.Serve(42069, myHandler)
+// Server is running in background now!
+// Main program continues...
+<-sigChan  // Wait for Ctrl+C
+server.Close()  // Gracefully shut down
+```
+
+### Using the Server: Example Application
+
+From [`cmd/httpServer/main.go`](cmd/httpServer/main.go):
+
+```go
+server, err := server.Serve(port, func(w io.Writer, req *request.Request) *server.HandlerError {
+    if req.RequestLine.RequestTarget == "/problem" {
+        return &server.HandlerError{
+            StatusCode: response.StatusBadRequest,
+            Message:    "Bad Request encountered!",
+        }
+    } else if req.RequestLine.RequestTarget == "/woopsie-daisy" {
+        return &server.HandlerError{
+            StatusCode: response.StatusInternalServerError,
+            Message:    "Woopsie internal Server Error encountered!",
+        }
+    } else {
+        w.Write([]byte("All good \n"))
+    }
+
+    return nil
+})
+```
+
+**Handler logic:**
+
+- **Route: `/problem`** → Return 400 Bad Request
+- **Route: `/woopsie-daisy`** → Return 500 Internal Server Error
+- **Any other route** → Write "All good \n" and return 200 OK
+
+**Testing it:**
+
+```bash
+curl http://localhost:42069/hello
+# Response:
+# HTTP/1.1 200 OK
+# Content-Length: 10
+# Connection: close
+# Content-Type: text/plain
+#
+# All good
+
+curl http://localhost:42069/problem
+# Response:
+# HTTP/1.1 400 Bad Request
+# Content-Length: 26
+# Connection: close
+# Content-Type: text/plain
+#
+# Bad Request encountered!
+```
+
+### Graceful Shutdown
+
+```go
+sigChan := make(chan os.Signal, 1)
+signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+<-sigChan  // Blocks until Ctrl+C or kill signal
+log.Println("Server gracefully stopped")
+```
+
+**What this does:**
+
+1. Creates a channel to receive OS signals
+2. Registers for SIGINT (Ctrl+C) and SIGTERM (kill)
+3. Blocks until signal received
+4. Logs and exits gracefully
+
+**Why this matters:**
+
+Without signal handling:
+
+- Server runs forever, can't be stopped cleanly
+- Ctrl+C just kills the process abruptly
+
+With signal handling:
+
+- Ctrl+C triggers graceful shutdown
+- Server can finish in-flight requests
+- Clean exit with proper logging
+
+### The Complete Request-Response Flow
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 1. Client sends HTTP request over TCP                  │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 2. Server: listener.Accept() - Accept connection       │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 3. Spawn goroutine: go runConnection()                 │
+│    (Server can now accept more connections!)           │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 4. Parse request: request.RequestFromReader()          │
+│    - StateInit: Parse request line                     │
+│    - StateHeaders: Parse headers                       │
+│    - StateBody: Parse body (if Content-Length > 0)     │
+│    - StateDone: Request complete!                      │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 5. Run handler: handler(buffer, request)               │
+│    - Check route (/problem, /woopsie-daisy, etc.)     │
+│    - Write response body to buffer                     │
+│    - Return HandlerError or nil                        │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 6. Determine response status and body                  │
+│    - Error? Use error status + message                 │
+│    - Success? Use 200 OK + buffer contents             │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 7. Update Content-Length header                        │
+│    (Now we know body size!)                            │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 8. Write response to TCP connection                    │
+│    a. WriteStatusLine: HTTP/1.1 200 OK\r\n            │
+│    b. WriteHeaders: Content-Length: 10\r\n...\r\n     │
+│    c. Write body: All good \n                          │
+└──────────────────────┬──────────────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│ 9. Close connection (Connection: close)                │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Key Design Patterns Used
+
+**1. io.Writer Interface for Flexibility**
+
+```go
+func WriteStatusLine(w io.Writer, statusCode StatusCode)
+func WriteHeaders(w io.Writer, headers *headers.Headers)
+```
+
+These functions accept **any** `io.Writer`:
+
+- TCP connection: Write directly to client
+- Buffer: Collect data before sending
+- File: Log responses to disk
+- Test: Capture output for assertions
+
+This is **interface-based design** - makes code reusable and testable!
+
+**2. Buffering Strategy**
+
+```go
+writer := bytes.NewBuffer([]byte{})
+handlerError := s.handler(writer, r)
+body := writer.Bytes()
+```
+
+**Problem:** We need `Content-Length` header **before** body, but we don't know body size until handler finishes.
+
+**Solution:** Write to buffer first, measure, then send with headers. This is a common pattern in HTTP servers!
+
+**3. Goroutines for Concurrency**
+
+```go
+go runConnection(s, conn)
+```
+
+Each connection handled in a separate goroutine → **concurrent request handling** for free! Go's runtime manages thousands of goroutines efficiently.
+
+**4. Error Handling via Return Values**
+
+```go
+type HandlerError struct {
+    StatusCode response.StatusCode
+    Message    string
+}
+```
+
+Instead of panicking or returning generic errors, handlers return **structured errors** that the server can format as proper HTTP responses.
+
+**5. Graceful Shutdown with Signals**
+
+```go
+signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+```
+
+Production servers need to shut down cleanly. Signal handling allows:
+
+- Finishing in-flight requests
+- Closing connections gracefully
+- Cleaning up resources
+
+### Testing Your Server
+
+**Start the server:**
+
+```bash
+go run ./cmd/httpServer
+```
+
+**Test successful request:**
+
+```bash
+curl -v http://localhost:42069/hello
+```
+
+Output:
+
+```
+HTTP/1.1 200 OK
+Content-Length: 10
+Connection: close
+Content-Type: text/plain
+
+All good
+```
+
+**Test error handling:**
+
+```bash
+curl -v http://localhost:42069/problem
+```
+
+Output:
+
+```
+HTTP/1.1 400 Bad Request
+Content-Length: 26
+Connection: close
+Content-Type: text/plain
+
+Bad Request encountered!
+```
+
+**Test with POST body:**
+
+```bash
+curl -X POST http://localhost:42069/test \
+  -H "Content-Type: application/json" \
+  -d '{"hello":"world"}'
+```
+
+The server will:
+
+1. Parse the request line
+2. Parse headers (including Content-Type)
+3. Parse body (12 bytes based on Content-Length)
+4. Run handler
+5. Send response
+
+### Summary: Building on the Foundation
+
+**What we built:**
+
+1. **Request Parser** (previous work)
+    - Streaming parser with state machine
+    - Handles chunked data
+    - Parses request line, headers, and body
+
+2. **Response Generator** (new!)
+    - Formats HTTP responses
+    - Handles status codes and headers
+    - Writes data in correct order
+
+3. **Server** (new!)
+    - Accepts TCP connections
+    - Parses requests using our parser
+    - Runs user-defined handlers
+    - Generates and sends responses
+    - Handles multiple clients concurrently
+
+**Why this architecture works:**
+
+- **Separation of concerns:** Request parsing, response generation, and server logic are separate
+- **Reusable components:** Response writer can be used in any Go program
+- **Testable:** Each component can be tested independently
+- **Concurrent:** Goroutines handle multiple clients simultaneously
+- **Standards-compliant:** Follows HTTP/1.1 specification
+
+You've now built a **working HTTP server from scratch** using only TCP sockets and the HTTP specification! This is the same fundamental architecture used by production servers like nginx, Apache, and Go's `net/http` package. 🚀
+
+---

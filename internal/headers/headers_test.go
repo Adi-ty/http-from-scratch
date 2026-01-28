@@ -45,4 +45,3 @@ func TestHeaderParse(t *testing.T) {
 	assert.Equal(t, "localhost:42069,localhost:42069", value)
 	assert.False(t, done)
 }
-

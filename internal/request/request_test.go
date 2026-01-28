@@ -113,4 +113,3 @@ func TestParseBody(t *testing.T) {
 	r, err = RequestFromReader(reader)
 	require.Error(t, err)
 }
-

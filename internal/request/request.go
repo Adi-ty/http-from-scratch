@@ -183,4 +183,3 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 
 	return request, nil
 }
-

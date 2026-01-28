@@ -39,4 +39,3 @@ func main() {
 		fmt.Printf("\n%s\n", r.Body)
 	}
 }
-

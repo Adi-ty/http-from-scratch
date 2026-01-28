@@ -112,4 +112,3 @@ func (h *Headers) Parse(data []byte) (int, bool, error) {
 
 	return read, done, nil
 }
-
