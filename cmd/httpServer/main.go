@@ -66,6 +66,13 @@ func main() {
 		} else if req.RequestLine.RequestTarget == "/woopsie-daisy" {
 			body = responsd500()
 			status = response.StatusInternalServerError
+		} else if req.RequestLine.RequestTarget == "/video" {
+			f, _ := os.ReadFile("assets/demo.mp4")
+			h.Replace("content-type", "video/mp4")
+			h.Replace("content-length", fmt.Sprintf("%d", len(f)))
+			w.WriteStatusLine(response.StatusOK)
+			w.WriteHeaders(*h)
+			w.WriteBody(f)
 		} else if strings.HasPrefix(req.RequestLine.RequestTarget, "/httpbin/") {
 			target := req.RequestLine.RequestTarget
 
