@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/Adi-ty/http-from-scratch/internal/request"
@@ -62,6 +64,34 @@ func main() {
 		} else if req.RequestLine.RequestTarget == "/woopsie-daisy" {
 			body = responsd500()
 			status = response.StatusInternalServerError
+		} else if strings.HasPrefix(req.RequestLine.RequestTarget, "/httpbin/stream") {
+			target := req.RequestLine.RequestTarget
+
+			res, err := http.Get("https://httpbin.org/" + target[len("/httpbin/"):])
+			if err != nil {
+				body = responsd500()
+				status = response.StatusInternalServerError
+			} else {
+				w.WriteStatusLine(response.StatusOK)
+				h.Delete("Content-Length")
+				h.Set("transfer-encoding", "chunked")
+				h.Replace("content-type", "text/plain")
+				w.WriteHeaders(*h)
+				
+				for {
+					data := make([]byte, 32)
+					n, err := res.Body.Read(data)
+					if err != nil {
+						break
+					}
+
+					w.WriteBody([]byte(fmt.Sprintf("%x\r\n", n)))
+					w.WriteBody(data[:n])
+					w.WriteBody([]byte("\r\n"))
+				}
+				w.WriteBody([]byte("0\r\n\r\n"))
+				return
+			}
 		}
 
 		h.Replace("Content-Length", fmt.Sprintf("%d", len(body)))
